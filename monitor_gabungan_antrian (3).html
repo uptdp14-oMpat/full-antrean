@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Monitor Gabungan Antrian - Puskesmas Ngemplak Simongan</title>
+<style>
+  :root { --bg:#45445c; --teal:#0e706c; --green:#24a148; --red:#dc3545; --ink:#18212a; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; width:100%; height:100%; font-family:Arial,Helvetica,sans-serif; background:var(--bg); color:white; }
+  body { display:flex; flex-direction:column; }
+  header { flex:0 0 auto; background:var(--teal); padding:12px 20px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+  header h1 { margin:0; font-size:clamp(18px,2vw,30px); }
+  header p { margin:5px 0 0; font-size:clamp(11px,1vw,15px); }
+  .actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .clock { text-align:right; line-height:1.15; margin-right:8px; }
+  .clock b { display:block; font-size:clamp(22px,2.6vw,40px); font-variant-numeric:tabular-nums; }
+  .clock span { font-size:clamp(11px,1vw,15px); }
+  .zl { font-weight:700; min-width:44px; text-align:center; }
+  button { border:0; border-radius:6px; padding:9px 12px; font-weight:700; cursor:pointer; }
+  .layout { flex:1; min-height:0; grid-auto-rows:minmax(0,1fr); padding:12px; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+  .panel { min-width:0; background:#fff; border:2px solid #d7e0e5; border-radius:4px; overflow:hidden; display:flex; flex-direction:column; min-height:0; }
+  .panel h2 { margin:0; padding:8px 12px; background:var(--red); color:#fff; text-align:center; font-size:clamp(16px,1.5vw,23px); position:relative; }
+  .panel:nth-child(even) h2 { background:var(--green); }
+  /* Indikator status sambungan (pojok tengen judul) */
+  .st { position:absolute; right:10px; top:50%; transform:translateY(-50%); display:flex; align-items:center; gap:6px; font-size:12px; font-weight:400; }
+  .dot { width:11px; height:11px; border-radius:50%; background:#cfd8dc; border:2px solid #fff; }
+  .panel[data-state="ok"] .dot { background:#69f0ae; }
+  .panel[data-state="warn"] .dot { background:#ffd54f; }
+  .panel[data-state="bad"] .dot { background:#212121; }
+  .verify { font-size:11px; font-weight:400; position:absolute; left:10px; top:50%; transform:translateY(-50%); background:#ffd54f; color:#222; padding:2px 6px; border-radius:3px; }
+  .frame-wrap { position:relative; flex:1; min-height:0; background:#fff; overflow:hidden; }
+  iframe { border:0; position:absolute; top:0; left:0; background:white; transform-origin:0 0; }
+  .hint { display:none; position:absolute; inset:0; background:#fff; color:#27313b; padding:18px; text-align:center; }
+  .panel[data-state="bad"] .hint { display:block; }
+  footer { flex:0 0 auto; padding:7px 12px; background:var(--teal); text-align:center; font-weight:bold; }
+  @media(max-width:850px) {
+    html,body { height:auto; }
+    .layout { grid-template-columns:1fr; grid-auto-rows:auto; }
+    .panel { height:65vh; }
+    header { align-items:flex-start; flex-direction:column; }
+  }
+  @media(min-width:1500px) {
+    .layout { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>MONITOR GABUNGAN ANTRIAN</h1>
+    <p>PUSKESMAS NGEMPLAK SIMONGAN · KOTA SEMARANG</p>
+  </div>
+  <div class="actions">
+    <div class="clock"><b id="time">--:--:--</b><span id="date"></span></div>
+    <button onclick="changeZoom(-0.05)" title="Perkecil isi monitor">Zoom −</button>
+    <span class="zl" id="zl">40%</span>
+    <button onclick="changeZoom(0.05)" title="Gedhekake isi monitor">Zoom +</button>
+    <button id="btnSound" onclick="enableSound()">Aktifake suara</button>
+    <button onclick="reloadFrames()">Muat ulang kabeh</button>
+    <button onclick="toggleFullscreen()">Layar penuh</button>
+  </div>
+</header>
+<main class="layout" id="layout"></main>
+<footer>SELAMAT DATANG DI PUSKESMAS NGEMPLAK SIMONGAN</footer>
+<script>
+/*
+  Yen link poli wis dipastikan, cukup owahi alamat ing dhaptar iki.
+  verify:true => katon tandha "Cek alamat" (KIA nganggo /monitor tanpa ?unit=...)
+  Nomor antrian = isi monitor asli (iframe). Ora ana angka karangan.
+*/
+const BASE = "http://192.168.16.2/ngemplak/antrian/monitor";
+const monitors = [
+  { name:"POLI CKG",       url: BASE + "?unit=ckg" },
+  { name:"POLI UMUM",      url: BASE + "?unit=UMUM" },
+  { name:"POLI KIA",       url: BASE, verify:true },
+  { name:"POLI IMUNISASI", url: BASE + "?unit=imunisasi" },
+  { name:"POLI MTBS",      url: BASE + "?unit=mtbs" }
+];
+const DEFAULT_ZOOM = 0.40;    // 40% – isi monitor asli diciutake supaya muat sak panel
+/* Suara: saben poli bisa dipateni nganggo sound:false (conto: { name:"POLI X", url:"...", sound:false })
+   Yen kabeh poli suarane urip bareng, swara bisa tumpang-tindih. */
+const PROBE_EVERY_SEC = 30;   // cek server bisa dijangkau (GET ringan, mung maca)
+const LOAD_TIMEOUT_SEC = 15;  // watesan nunggu iframe
+
+const layout = document.getElementById("layout");
+const panels = [];
+
+monitors.forEach(item => {
+  const panel = document.createElement("section");
+  panel.className = "panel";
+  panel.dataset.state = "idle";
+  const heading = document.createElement("h2");
+  heading.textContent = item.name;
+  if (item.verify) {
+    const v = document.createElement("span");
+    v.className = "verify"; v.textContent = "Cek alamat";
+    heading.append(v);
+  }
+  const st = document.createElement("span");
+  st.className = "st";
+  st.innerHTML = "<span class='stxt'>Nyambung…</span><span class='dot'></span>";
+  heading.append(st);
+
+  const wrap = document.createElement("div");
+  wrap.className = "frame-wrap";
+  const frame = document.createElement("iframe");
+  frame.title = item.name;
+  frame.loading = "eager";
+  frame.referrerPolicy = "no-referrer";
+  // Ngidini monitor asli muter swara (autoplay) saka jero iframe
+  if (item.sound !== false) frame.setAttribute("allow", "autoplay; fullscreen");
+  const hint = document.createElement("div");
+  hint.className = "hint";
+  hint.innerHTML = "<b>Monitor iki ora bisa ditampilke ing kene.</b><p>Server ora bisa dijangkau utawa alamat nolak dibukak liwat iframe.</p><a target='_blank' rel='noopener' href='" + item.url + "'>Bukak monitor dhewe</a>";
+  wrap.append(frame, hint);
+  panel.append(heading, wrap);
+  layout.append(panel);
+
+  const p = { item, panel, frame, wrap, loaded:false, timer:null, txt: st.querySelector(".stxt") };
+  panels.push(p);
+  frame.addEventListener("load", () => { p.loaded = true; clearTimeout(p.timer); probe(p); });
+  load(p);
+});
+
+function setState(p, state, text) { p.panel.dataset.state = state; p.txt.textContent = text; }
+
+function load(p) {
+  p.loaded = false; clearTimeout(p.timer);
+  setState(p, "idle", "Nyambung…");
+  p.frame.src = p.item.url;
+  p.timer = setTimeout(() => { if (!p.loaded) setState(p, "bad", "Wektu entek"); }, LOAD_TIMEOUT_SEC * 1000);
+}
+
+/* Cek jujur: fetch no-cors mung mbuktekake SERVER bisa dijangkau.
+   Ora bisa mbuktekake isi iframe bener, lan nomor antrian ora bisa diwaca
+   saka kene (same-origin policy). Nomor katon saka iframe monitor asli. */
+async function probe(p) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 8000);
+  try {
+    await fetch(p.item.url, { mode:"no-cors", cache:"no-store", signal:ctl.signal });
+    clearTimeout(t);
+    setState(p, p.loaded ? "ok" : "warn", p.loaded ? "Server nyambung" : "Nunggu tampilan");
+  } catch (e) {
+    clearTimeout(t);
+    setState(p, "bad", "Ora bisa dijangkau");
+  }
+}
+
+/* Iframe digawe amba/dhuwur = ukuran panel / zoom, banjur di-scale.
+   Dadi isi monitor asli katon utuh ing zoom 40% tanpa diowahi. */
+let zoom = DEFAULT_ZOOM;
+try { const z = parseFloat(localStorage.getItem("mg_zoom")); if (z >= 0.2 && z <= 1) zoom = z; } catch(e){}
+function fitAll() {
+  panels.forEach(p => {
+    p.frame.style.width  = (p.wrap.clientWidth  / zoom) + "px";
+    p.frame.style.height = (p.wrap.clientHeight / zoom) + "px";
+    p.frame.style.transform = "scale(" + zoom + ")";
+  });
+  document.getElementById("zl").textContent = Math.round(zoom * 100) + "%";
+}
+function changeZoom(d) {
+  zoom = Math.min(1, Math.max(0.2, Math.round((zoom + d) * 100) / 100));
+  try { localStorage.setItem("mg_zoom", zoom); } catch(e){}
+  fitAll();
+}
+new ResizeObserver(fitAll).observe(layout);
+fitAll();
+
+/* Suara: browser mblokir swara otomatis nganti ana klik saka pangguna ing kaca iki.
+   Klik tombol iki = "interaksi pangguna", banjur monitor dimuat ulang supaya
+   skrip monitor asli bisa muter swara (iframe wis nganggo allow="autoplay"). */
+function enableSound() {
+  try { new (window.AudioContext || window.webkitAudioContext)().resume(); } catch(e){}
+  const b = document.getElementById("btnSound");
+  b.textContent = "Suara siap ✓";
+  reloadFrames();
+}
+
+function reloadFrames() {
+  panels.forEach(p => { p.frame.src = "about:blank"; setTimeout(() => load(p), 120); });
+}
+function toggleFullscreen() {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen?.();
+  else document.exitFullscreen?.();
+}
+function tick() {
+  const d = new Date();
+  document.getElementById("time").textContent = d.toLocaleTimeString("id-ID", { hour12:false });
+  document.getElementById("date").textContent = d.toLocaleDateString("id-ID", { weekday:"long", day:"numeric", month:"long", year:"numeric" });
+}
+setInterval(tick, 1000); tick();
+setInterval(() => panels.forEach(probe), PROBE_EVERY_SEC * 1000);
+</script>
+</body>
+</html>
